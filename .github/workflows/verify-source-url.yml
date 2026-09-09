@@ -1,0 +1,82 @@
+name: Verify source-url mode
+
+on:
+  push:
+    paths:
+      - '.github/workflows/verify-source-url.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install package
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e .
+
+      - name: Verify CLI and syntax
+        run: |
+          python -m py_compile iptv_scraper/cli.py
+          iptv-scraper --help | grep -q -- '--source-url'
+          iptv-scraper --version
+
+      - name: End-to-end source URL test
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/iptv-test
+          cat > /tmp/iptv-test/index.html <<'HTML'
+          <!doctype html>
+          <html><head><title>Test Channel</title></head>
+          <body><video><source src="/live.m3u8" type="application/vnd.apple.mpegurl"></video></body></html>
+          HTML
+          cat > /tmp/iptv-test/live.m3u8 <<'M3U'
+          #EXTM3U
+          #EXT-X-VERSION:3
+          #EXT-X-TARGETDURATION:5
+          #EXT-X-MEDIA-SEQUENCE:1
+          #EXTINF:5.0,
+          segment.ts
+          M3U
+          python - <<'PY'
+          from pathlib import Path
+          Path('/tmp/iptv-test/segment.ts').write_bytes(b'\x47' + b'video-data' * 2048)
+          PY
+          python -m http.server 8765 --directory /tmp/iptv-test >/tmp/iptv-http.log 2>&1 &
+          SERVER_PID=$!
+          trap 'kill $SERVER_PID || true' EXIT
+          sleep 1
+          python - <<'PY'
+          from iptv_scraper.cli import IPTVScraper
+          scraper = IPTVScraper()
+          found = scraper.scrape_source_urls(
+              ['http://127.0.0.1:8765/index.html'],
+              num_links=1,
+              channel_name='Test Channel',
+          )
+          assert found == 1, f'expected 1 working stream, got {found}'
+          assert len(scraper.scraped_links) == 1
+          assert scraper.scraped_links[0]['url'] == 'http://127.0.0.1:8765/live.m3u8'
+          print('END_TO_END_SOURCE_URL_OK')
+          PY
+
+      - name: Remove temporary workflow
+        if: success()
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          rm -f .github/workflows/verify-source-url.yml
+          git add -A
+          git commit -m 'Remove temporary source-url verification workflow'
+          git push
