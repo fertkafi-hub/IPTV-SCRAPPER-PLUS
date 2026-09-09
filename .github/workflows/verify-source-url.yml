@@ -1,9 +1,9 @@
-name: Verify source-url mode
+name: Verify source url
 
 on:
   push:
     paths:
-      - '.github/workflows/verify-source-url.yml'
+      - .github/workflows/verify-source-url.yml
 
 permissions:
   contents: write
@@ -12,110 +12,33 @@ jobs:
   verify:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
-      - name: Fix HLS validation order
-        shell: bash
-        run: |
-          python - <<'PY'
-          from pathlib import Path
-
-          path = Path('iptv_scraper/cli.py')
-          text = path.read_text(encoding='utf-8')
-
-          old = '''            if not self.test_iptv_link(stream_url, show_progress=False):
-                print(colored("✗", "red"))
-                continue
-
-            path_only = stream_url.lower().split('?', 1)[0]
-            if path_only.endswith('.m3u8'):
-                if not self._validate_hls_segment_delivery(stream_url):
-                    print(colored("✗ manifest reachable, but no media segment", "red"))
-                    continue
-'''
-
-          new = '''            path_only = stream_url.lower().split('?', 1)[0]
-            if path_only.endswith('.m3u8'):
-                # HLS manifests can be very small. Validate the manifest and
-                # require actual media-segment bytes instead of applying the
-                # legacy minimum Content-Length check first.
-                if not self._validate_hls_segment_delivery(stream_url):
-                    print(colored("✗ manifest reachable, but no media segment", "red"))
-                    continue
-            elif not self.test_iptv_link(stream_url, show_progress=False):
-                print(colored("✗", "red"))
-                continue
-'''
-
-          if old not in text:
-              raise SystemExit('Expected HLS validation block not found')
-
-          path.write_text(text.replace(old, new, 1), encoding='utf-8')
-          PY
-
-      - name: Install package
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e .
-
-      - name: Verify CLI and syntax
+      - name: Apply fix
+        run: python .github/patch_source_url.py
+      - name: Install
+        run: python -m pip install -e .
+      - name: Check CLI
         run: |
           python -m py_compile iptv_scraper/cli.py
           iptv-scraper --help | grep -q -- '--source-url'
           iptv-scraper --version
-
-      - name: End-to-end source URL test
-        shell: bash
+      - name: Test HLS page extraction
         run: |
-          set -euo pipefail
           mkdir -p /tmp/iptv-test
-          cat > /tmp/iptv-test/index.html <<'HTML'
-          <!doctype html>
-          <html><head><title>Test Channel</title></head>
-          <body><video><source src="/live.m3u8" type="application/vnd.apple.mpegurl"></video></body></html>
-          HTML
-          cat > /tmp/iptv-test/live.m3u8 <<'M3U'
-          #EXTM3U
-          #EXT-X-VERSION:3
-          #EXT-X-TARGETDURATION:5
-          #EXT-X-MEDIA-SEQUENCE:1
-          #EXTINF:5.0,
-          segment.ts
-          M3U
-          python - <<'PY'
-          from pathlib import Path
-          Path('/tmp/iptv-test/segment.ts').write_bytes(b'\x47' + b'video-data' * 2048)
-          PY
+          printf '%s\n' '<html><head><title>Test Channel</title></head><body><video><source src="/live.m3u8"></video></body></html>' > /tmp/iptv-test/index.html
+          printf '%s\n' '#EXTM3U' '#EXT-X-VERSION:3' '#EXT-X-TARGETDURATION:5' '#EXT-X-MEDIA-SEQUENCE:1' '#EXTINF:5.0,' 'segment.ts' > /tmp/iptv-test/live.m3u8
+          python -c "from pathlib import Path; Path('/tmp/iptv-test/segment.ts').write_bytes(b'\\x47' + b'video-data' * 2048)"
           python -m http.server 8765 --directory /tmp/iptv-test >/tmp/iptv-http.log 2>&1 &
-          SERVER_PID=$!
-          trap 'kill $SERVER_PID || true' EXIT
           sleep 1
-          python - <<'PY'
-          from iptv_scraper.cli import IPTVScraper
-          scraper = IPTVScraper()
-          found = scraper.scrape_source_urls(
-              ['http://127.0.0.1:8765/index.html'],
-              num_links=1,
-              channel_name='Test Channel',
-          )
-          assert found == 1, f'expected 1 working stream, got {found}'
-          assert len(scraper.scraped_links) == 1
-          assert scraper.scraped_links[0]['url'] == 'http://127.0.0.1:8765/live.m3u8'
-          print('END_TO_END_SOURCE_URL_OK')
-          PY
-
-      - name: Commit verified fix and remove workflow
-        if: success()
+          python -c "from iptv_scraper.cli import IPTVScraper; s=IPTVScraper(); f=s.scrape_source_urls(['http://127.0.0.1:8765/index.html'], num_links=1, channel_name='Test Channel'); assert f == 1, f; assert s.scraped_links[0]['url'] == 'http://127.0.0.1:8765/live.m3u8'; print('END_TO_END_SOURCE_URL_OK')"
+      - name: Commit verified fix
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          rm -f .github/workflows/verify-source-url.yml
+          rm -f .github/workflows/verify-source-url.yml .github/patch_source_url.py
           git add -A
-          git commit -m 'Fix HLS validation for source-url mode'
+          git commit -m 'Fix and verify source-url HLS validation'
           git push
