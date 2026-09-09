@@ -20,6 +20,45 @@ jobs:
         with:
           python-version: '3.12'
 
+      - name: Fix HLS validation order
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+
+          path = Path('iptv_scraper/cli.py')
+          text = path.read_text(encoding='utf-8')
+
+          old = '''            if not self.test_iptv_link(stream_url, show_progress=False):
+                print(colored("✗", "red"))
+                continue
+
+            path_only = stream_url.lower().split('?', 1)[0]
+            if path_only.endswith('.m3u8'):
+                if not self._validate_hls_segment_delivery(stream_url):
+                    print(colored("✗ manifest reachable, but no media segment", "red"))
+                    continue
+'''
+
+          new = '''            path_only = stream_url.lower().split('?', 1)[0]
+            if path_only.endswith('.m3u8'):
+                # HLS manifests can be very small. Validate the manifest and
+                # require actual media-segment bytes instead of applying the
+                # legacy minimum Content-Length check first.
+                if not self._validate_hls_segment_delivery(stream_url):
+                    print(colored("✗ manifest reachable, but no media segment", "red"))
+                    continue
+            elif not self.test_iptv_link(stream_url, show_progress=False):
+                print(colored("✗", "red"))
+                continue
+'''
+
+          if old not in text:
+              raise SystemExit('Expected HLS validation block not found')
+
+          path.write_text(text.replace(old, new, 1), encoding='utf-8')
+          PY
+
       - name: Install package
         run: |
           python -m pip install --upgrade pip
@@ -71,12 +110,12 @@ jobs:
           print('END_TO_END_SOURCE_URL_OK')
           PY
 
-      - name: Remove temporary workflow
+      - name: Commit verified fix and remove workflow
         if: success()
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           rm -f .github/workflows/verify-source-url.yml
           git add -A
-          git commit -m 'Remove temporary source-url verification workflow'
+          git commit -m 'Fix HLS validation for source-url mode'
           git push
