@@ -1,0 +1,53 @@
+name: Upgrade v2.9.0 browser source mode
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - .github/workflows/upgrade-v290.yml
+
+permissions:
+  contents: write
+
+jobs:
+  upgrade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.13'
+
+      - name: Apply v2.9.0 patch
+        run: python .github/upgrade_v290.py
+
+      - name: Compile Python
+        run: python -m compileall -q iptv_scraper tests
+
+      - name: Install package
+        run: python -m pip install -e .
+
+      - name: Verify CLI flags and version
+        shell: bash
+        run: |
+          iptv-scraper --help | grep -- '--browser'
+          iptv-scraper --help | grep -- '--wait-player'
+          iptv-scraper --version | grep '2.9.0'
+
+      - name: Run source URL tests
+        run: python -m unittest tests/test_source_url_v290.py -v
+
+      - name: Commit verified upgrade
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          rm -f .github/upgrade_v290.py .github/workflows/upgrade-v290.yml
+          git add -A
+          git commit -m "Add v2.9.0 dynamic public player mode"
+          git push
