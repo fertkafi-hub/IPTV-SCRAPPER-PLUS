@@ -7,7 +7,7 @@ import datetime
 import os
 import argparse
 import re
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qs
 import subprocess
 import sys
 import threading
@@ -642,6 +642,33 @@ class IPTVScraper:
         path_only = clean_url.split('?', 1)[0]
         return path_only.endswith(('.m3u8', '.m3u', '.mpd', '.ts'))
 
+    def _is_protected_player_url(self, url):
+        """Return True for signed/authenticated/DRM-style player URLs.
+
+        Browser source mode may observe these URLs, but it deliberately does not
+        reuse credentials, signatures, tokens, cookies, or license endpoints.
+        """
+        if not url or not url.startswith(('http://', 'https://')):
+            return False
+
+        try:
+            parsed = urlparse(url)
+            params = {key.lower() for key in parse_qs(parsed.query, keep_blank_values=True)}
+        except Exception:
+            return False
+
+        protected_params = {
+            'sig', 'signature', 'token', 'auth', 'authorization', 'jwt',
+            'hdnts', 'hdnea', 'policy', 'key-pair-id', 'license',
+        }
+        if params.intersection(protected_params):
+            return True
+
+        path = (parsed.path or '').lower()
+        return any(marker in path for marker in (
+            '/license', 'widevine', 'playready', 'fairplay',
+        ))
+
     def _extract_public_stream_candidates(self, html_content, base_url):
         """Extract direct stream URLs and embedded player pages from public HTML."""
         stream_urls = set()
@@ -664,11 +691,29 @@ class IPTVScraper:
                     if not resolved.startswith(('http://', 'https://')):
                         continue
 
-                    if tag_name in ('iframe', 'embed'):
+                    if tag_name in ('iframe', 'embed') and not self._is_protected_player_url(resolved):
                         embed_urls.add(resolved)
 
-                    if self._is_public_stream_candidate(resolved):
+                    if self._is_public_stream_candidate(resolved) and not self._is_protected_player_url(resolved):
                         stream_urls.add(resolved)
+
+            # Dynamic players often keep the next player URL on buttons or links
+            # and assign it to an iframe later with JavaScript (frame.src = ...).
+            for tag in soup.find_all(attrs={'data-src': True}):
+                raw_url = (tag.get('data-src') or '').strip()
+                if not raw_url:
+                    continue
+                if raw_url.startswith('//'):
+                    raw_url = 'https:' + raw_url
+                resolved = urljoin(base_url, raw_url)
+                if not resolved.startswith(('http://', 'https://')):
+                    continue
+                if self._is_protected_player_url(resolved):
+                    continue
+                if self._is_public_stream_candidate(resolved):
+                    stream_urls.add(resolved)
+                elif tag.name in ('button', 'a', 'iframe', 'embed'):
+                    embed_urls.add(resolved)
 
             # Many players place the media URL inside inline JavaScript/JSON.
             normalized_html = html_content.replace('\\/', '/')
@@ -707,7 +752,6 @@ class IPTVScraper:
                     timeout=timeout,
                     allow_redirects=True,
                     headers=headers,
-                    verify=False,
                 )
                 if response.status_code != 200:
                     return False
@@ -745,7 +789,6 @@ class IPTVScraper:
                     stream=True,
                     allow_redirects=True,
                     headers=headers,
-                    verify=False,
                 ) as segment_response:
                     if segment_response.status_code not in (200, 206):
                         return False
@@ -793,13 +836,19 @@ class IPTVScraper:
                     continue
                 visited_pages.add(page_url)
 
+                if self._is_protected_player_url(page_url):
+                    print(colored(
+                        f"[!] Signed/authenticated player skipped: {urlparse(page_url).netloc}",
+                        "yellow"
+                    ))
+                    continue
+
                 try:
                     response = self.session.get(
                         page_url,
                         timeout=10,
                         allow_redirects=True,
                         headers=headers,
-                        verify=False,
                     )
                     if response.status_code != 200:
                         print(colored(
@@ -841,6 +890,12 @@ class IPTVScraper:
                         for embed_url in embeds:
                             if embeds_seen_for_source >= 12:
                                 break
+                            if self._is_protected_player_url(embed_url):
+                                print(colored(
+                                    f"[!] Signed/authenticated embedded player skipped: {urlparse(embed_url).netloc}",
+                                    "yellow"
+                                ))
+                                continue
                             if embed_url not in visited_pages:
                                 queue.append((embed_url, depth + 1))
                                 embeds_seen_for_source += 1
@@ -894,6 +949,214 @@ class IPTVScraper:
             "green"
         ))
         print(colored("=" * 60, "green"))
+
+        return len(self.scraped_links)
+
+    def scrape_source_urls_browser(self, source_urls, num_links=10, channel_name='', wait_player=False):
+        """Use a real browser to inspect public dynamic players without bypassing access controls."""
+        if isinstance(source_urls, str):
+            source_urls = [source_urls]
+
+        try:
+            from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
+        except ImportError:
+            print(colored("[!] Browser mode requires Playwright.", "red"))
+            print(colored('    Install with: python3 -m pip install -e ".[browser]"', "yellow"))
+            print(colored("    Then run: python3 -m playwright install chromium", "yellow"))
+            return 0
+
+        candidates = {}
+        protected_seen = set()
+        wait_seconds = 12 if wait_player else 2
+
+        def countdown_hint(page):
+            texts = []
+            try:
+                texts.append(page.locator('body').inner_text(timeout=1000))
+            except Exception:
+                pass
+            for frame in page.frames:
+                if self._is_protected_player_url(frame.url):
+                    continue
+                try:
+                    texts.append(frame.locator('body').inner_text(timeout=700))
+                except Exception:
+                    pass
+            joined = '\n'.join(texts)
+            match = re.search(
+                r'(?:espera|wait|segundos|seconds|continuar|continue)[^0-9]{0,24}(\d{1,2})'
+                r'|(\d{1,2})[^\n]{0,24}(?:segundos|seconds)',
+                joined,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                return match.group(1) or match.group(2)
+            return None
+
+        print(colored(f"[*] Browser mode loading {len(source_urls)} source page(s)...", "cyan"))
+
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=True)
+                context = browser.new_context(
+                    user_agent=(
+                        'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                        'AppleWebKit/537.36 Chrome/128.0 Safari/537.36'
+                    )
+                )
+
+                for source_url in source_urls:
+                    if self.shutdown_flag.is_set() or self.total_working >= num_links:
+                        break
+                    if not source_url.startswith(('http://', 'https://')):
+                        print(colored(f"[!] Skipping invalid URL: {source_url}", "red"))
+                        continue
+                    if self._is_protected_player_url(source_url):
+                        print(colored("[!] Signed/authenticated source URL skipped.", "yellow"))
+                        continue
+
+                    page = context.new_page()
+                    page_candidates = {}
+                    fallback_title = urlparse(source_url).netloc or 'Web Stream'
+                    current_title = channel_name or fallback_title
+
+                    def observe_request(request):
+                        nonlocal current_title
+                        request_url = request.url
+                        try:
+                            frame_url = request.frame.url
+                        except Exception:
+                            frame_url = ''
+
+                        if self._is_protected_player_url(request_url) or self._is_protected_player_url(frame_url):
+                            host = urlparse(request_url).netloc or request_url
+                            protected_seen.add(host)
+                            return
+
+                        if self._is_public_stream_candidate(request_url):
+                            page_candidates.setdefault(request_url, current_title)
+
+                    page.on('request', observe_request)
+
+                    try:
+                        print(colored(f"[*] Opening: {source_url}", "white"))
+                        page.goto(source_url, wait_until='domcontentloaded', timeout=30000)
+                        try:
+                            current_title = channel_name or page.title() or fallback_title
+                        except Exception:
+                            current_title = channel_name or fallback_title
+
+                        # Inspect the fully rendered page first.
+                        streams, embeds = self._extract_public_stream_candidates(page.content(), page.url)
+                        for stream_url in streams:
+                            page_candidates.setdefault(stream_url, current_title)
+                        for embed_url in embeds:
+                            if self._is_protected_player_url(embed_url):
+                                protected_seen.add(urlparse(embed_url).netloc or embed_url)
+
+                        options = page.locator('.option[data-src]')
+                        option_count = min(options.count(), 6)
+                        if option_count:
+                            print(colored(f"[+] Found {option_count} player option(s).", "green"))
+
+                        for index in range(option_count):
+                            option = options.nth(index)
+                            data_src = option.get_attribute('data-src') or ''
+                            label = (option.inner_text(timeout=1000) or f'Option {index + 1}').strip()
+
+                            if self._is_protected_player_url(data_src):
+                                protected_seen.add(urlparse(data_src).netloc or data_src)
+                                print(colored(f"[!] {label}: signed/authenticated URL skipped.", "yellow"))
+                                continue
+
+                            print(colored(f"[*] Opening {label} and waiting for normal player initialization...", "cyan"))
+                            try:
+                                option.click(timeout=5000)
+                            except PlaywrightTimeoutError:
+                                print(colored(f"[!] Could not click {label}; continuing.", "yellow"))
+                                continue
+
+                            for second in range(wait_seconds):
+                                page.wait_for_timeout(1000)
+                                if wait_player:
+                                    hint = countdown_hint(page)
+                                    if hint:
+                                        print(colored(f"    countdown detected: {hint}", "cyan"))
+
+                            # Inspect frame URLs and rendered HTML after the normal wait.
+                            for frame in page.frames:
+                                frame_url = frame.url or ''
+                                if self._is_protected_player_url(frame_url):
+                                    protected_seen.add(urlparse(frame_url).netloc or frame_url)
+                                    continue
+                                if self._is_public_stream_candidate(frame_url):
+                                    page_candidates.setdefault(frame_url, current_title)
+                                try:
+                                    frame_streams, _ = self._extract_public_stream_candidates(
+                                        frame.content(), frame_url or page.url
+                                    )
+                                    for stream_url in frame_streams:
+                                        page_candidates.setdefault(stream_url, current_title)
+                                except Exception:
+                                    pass
+
+                        for stream_url, title in page_candidates.items():
+                            candidates.setdefault(stream_url, title)
+
+                    except PlaywrightTimeoutError:
+                        print(colored(f"[✗] Browser timeout: {source_url}", "red"))
+                    except Exception as exc:
+                        print(colored(f"[✗] Browser error for {source_url}: {exc}", "red"))
+                    finally:
+                        page.close()
+
+                context.close()
+                browser.close()
+        except Exception as exc:
+            print(colored(f"[!] Could not start browser mode: {exc}", "red"))
+            print(colored("[*] If Chromium is missing, run: python3 -m playwright install chromium", "yellow"))
+            return 0
+
+        if protected_seen:
+            print(colored(
+                "[!] Signed/authenticated player layer detected; protected downstream media was not extracted.",
+                "yellow"
+            ))
+            for host in sorted(protected_seen):
+                print(colored(f"    - {host}", "yellow"))
+
+        if not candidates:
+            print(colored(
+                "[!] Browser mode did not expose any unprotected public .m3u8/.m3u/.mpd/.ts URL.",
+                "yellow"
+            ))
+            return 0
+
+        print(colored(f"[*] Browser observed {len(candidates)} public candidate stream URL(s).", "cyan"))
+        print(colored("[*] Validating candidates...", "yellow"))
+
+        for index, (stream_url, title) in enumerate(candidates.items(), 1):
+            if self.shutdown_flag.is_set() or self.total_working >= num_links:
+                break
+            if self._is_protected_player_url(stream_url):
+                continue
+
+            print(colored(f"[{index}/{len(candidates)}] {title}", "white"), end=" ")
+            path_only = stream_url.lower().split('?', 1)[0]
+            if path_only.endswith('.m3u8'):
+                if not self._validate_hls_segment_delivery(stream_url):
+                    print(colored("✗ manifest reachable, but no media segment", "red"))
+                    continue
+            elif not self.test_iptv_link(stream_url, show_progress=False):
+                print(colored("✗", "red"))
+                continue
+
+            self.total_working += 1
+            saved_title = title
+            if any(item.get('title') == saved_title for item in self.scraped_links):
+                saved_title = f"{title} {self.total_working}"
+            self.scraped_links.append({'title': saved_title, 'url': stream_url})
+            print(colored(f"✓ [{self.total_working}/{num_links}]", "green"))
 
         return len(self.scraped_links)
 
@@ -2089,6 +2352,18 @@ def main():
     )
 
     parser.add_argument(
+        '--browser',
+        action='store_true',
+        help='Use Playwright for JavaScript-rendered public channel pages'
+    )
+
+    parser.add_argument(
+        '--wait-player',
+        action='store_true',
+        help='With --browser, wait up to 12 seconds after each player option'
+    )
+
+    parser.add_argument(
         '--live-match',
         action='store_true',
         help='Search for live sports match streams (soccer, basketball, etc.)'
@@ -2144,7 +2419,7 @@ def main():
     art = text2art("IPTV  SCRAPER", font="block")
     print(colored(art, "cyan"))
     print(colored("═" * 70, "yellow"))
-    print(colored("        🎬 Advanced Multi-Source Stream Finder v2.8.0", "green"))
+    print(colored("        🎬 Advanced Multi-Source Stream Finder v2.9.0", "green"))
     print(colored("        ⚡ 25 Parallel Workers | 🔄 Connection Pooling | 🧠 Smart Filtering", "cyan"))
     print(colored("═" * 70, "yellow"))
     print(colored("        Developed By MSXI:7050", "magenta"))
@@ -2168,11 +2443,22 @@ def main():
             scraper = IPTVScraper()
             scraper_instance = scraper
             current_channel = channel_name or "source_url"
-            scraper.scrape_source_urls(
-                args.source_url,
-                num_links=num_links,
-                channel_name=channel_name,
-            )
+            if args.wait_player and not args.browser:
+                parser.error("--wait-player requires --browser")
+
+            if args.browser:
+                scraper.scrape_source_urls_browser(
+                    args.source_url,
+                    num_links=num_links,
+                    channel_name=channel_name,
+                    wait_player=args.wait_player,
+                )
+            else:
+                scraper.scrape_source_urls(
+                    args.source_url,
+                    num_links=num_links,
+                    channel_name=channel_name,
+                )
 
             if scraper.scraped_links:
                 output_name = args.output if args.output else (

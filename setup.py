@@ -5,7 +5,7 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="iptv-scraper",
-    version="2.8.0",
+    version="2.9.0",
     author="Musashi",
     author_email="",
     description="A powerful CLI tool to scrape and validate working IPTV links",
@@ -39,6 +39,9 @@ setup(
         "colorama>=0.4.0",
         "art>=5.0",
     ],
+    extras_require={
+        "browser": ["playwright>=1.40.0"],
+    },
     entry_points={
         "console_scripts": [
             "iptv-scraper=iptv_scraper.cli:main",

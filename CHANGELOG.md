@@ -1,5 +1,17 @@
 # IPTV Scraper - Complete Changelog
 
+## Version 2.9.0 (2026-09-08) - Dynamic Public Player Browser Mode 🌐
+
+- Added `--browser` and `--wait-player` for JavaScript-rendered public channel pages.
+- Added generic `data-src` player-option discovery (including button-driven iframe players).
+- Browser mode clicks normal player options and waits for the page/player to initialize naturally.
+- Observes direct public `.m3u8`, `.m3u`, `.mpd`, and `.ts` requests without collecting cookies or headers.
+- Detects signed/authenticated/DRM-style layers (`sig`, token/auth parameters, license endpoints) and skips protected downstream extraction.
+- New source-page/HLS requests use normal TLS certificate verification, avoiding the previous source-mode `InsecureRequestWarning`.
+- Playwright is optional via `pip install -e ".[browser]"`; Chromium is installed separately with `python3 -m playwright install chromium`.
+
+---
+
 ## Version 2.8.0 (2026-09-08) - Public Channel Page Sources 🌐
 
 - Added repeatable `--source-url URL` CLI option.

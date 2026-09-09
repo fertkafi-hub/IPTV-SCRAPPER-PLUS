@@ -3,7 +3,7 @@
 <p align="center">
   <img src="https://img.shields.io/badge/python-3.6+-blue.svg" alt="Python Version">
   <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License">
-  <img src="https://img.shields.io/badge/version-2.8.0-orange.svg" alt="Version">
+  <img src="https://img.shields.io/badge/version-2.9.0-orange.svg" alt="Version">
 </p>
 
 A powerful and fast CLI tool to scrape and validate working IPTV links from public sources. Features smart channel search, parallel link testing, and automatic M3U playlist generation.
@@ -17,7 +17,7 @@ A powerful and fast CLI tool to scrape and validate working IPTV links from publ
 | 🔍 **Smart Search** | Find channels by name with intelligent synonym matching |
 | ⚡ **Blazing Fast** | 25 parallel workers with connection pooling for 5x speed |
 | ✅ **Link Validation** | Tests each stream to ensure it actually works |
-| 🌐 **Web Page Sources** | Extract public stream URLs from channel pages with `--source-url` |
+| 🌐 **Web Page Sources** | Extract public streams from static or JavaScript-rendered channel pages |
 | 📺 **M3U Export** | Standard M3U playlist format compatible with VLC, Kodi, etc. |
 | 🎯 **Live Match Mode** | Special mode for finding live sports streams |
 | 📁 **Auto-Organization** | Creates dated folders for your playlists |
@@ -40,6 +40,13 @@ pip install .
 
 ```bash
 pip install -e .
+```
+
+### Browser mode (optional)
+
+```bash
+python3 -m pip install -e ".[browser]"
+python3 -m playwright install chromium
 ```
 
 ## 📖 Usage
@@ -70,6 +77,9 @@ iptv-scraper --source-url "https://example.com/live" -n 5
 # Repeat --source-url to scan several pages
 iptv-scraper --source-url "https://example.com/channel-1" --source-url "https://example.com/channel-2" -n 10
 
+# JavaScript-rendered public player: use a real browser and wait normally
+iptv-scraper --source-url "https://example.com/live" --browser --wait-player -n 5
+
 # Live sports match mode
 iptv-scraper --live-match -n 10
 
@@ -86,6 +96,8 @@ iptv-scraper --popular-channels
 | `-o, --output` | Custom output filename |
 | `--auto-save` | Skip save confirmation prompt |
 | `--source-url URL` | Scrape a public channel page; repeat the option for multiple pages |
+| `--browser` | Use Playwright for JavaScript-rendered public players |
+| `--wait-player` | With `--browser`, wait up to 12 seconds after each player option |
 | `--live-match` | Search live sports streaming sites |
 | `--popular-channels` | Display popular searchable channels |
 | `--update` | Update to the latest version |
@@ -139,6 +151,7 @@ iptv-scraper -c "cartoon" -n 8
 - termcolor
 - colorama
 - art
+- playwright (optional, only for `--browser`)
 
 ## 📄 License
 
