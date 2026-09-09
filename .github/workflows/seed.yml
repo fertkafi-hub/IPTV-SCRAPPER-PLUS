@@ -1,0 +1,36 @@
+name: Seed IPTV-SCRAPPER-PLUS
+
+on:
+  push:
+    paths:
+      - '.github/workflows/seed.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  seed:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout target repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Copy upstream IPTV Scraper source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 https://github.com/MohamedAminGrami/IPTV-SCRAPPER.git /tmp/iptv-upstream
+          rsync -a --exclude='.git' --exclude='.github' /tmp/iptv-upstream/ ./
+          rm -f .github/workflows/seed.yml
+
+      - name: Commit imported source
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -A
+          git commit -m 'Import IPTV Scraper base source' || exit 0
+          git push origin HEAD:main
