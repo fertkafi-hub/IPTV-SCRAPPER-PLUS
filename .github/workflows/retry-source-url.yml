@@ -1,0 +1,92 @@
+name: Retry source-url feature
+
+on:
+  push:
+    paths:
+      - '.github/workflows/retry-source-url.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Run corrected patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          workflow_path = Path('.github/workflows/add-source-url.yml')
+          workflow = workflow_path.read_text(encoding='utf-8')
+
+          match = re.search(
+              r"python3 - <<'PY'\n(?P<body>.*?\n)\s{10}PY\n",
+              workflow,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit('Could not extract original patch script')
+
+          script = textwrap.dedent(match.group('body'))
+          old_anchor = r"""parser_anchor = '''    parser\.add_argument\(
+              '--live-match',
+              action='store_true',
+              help='Search for live sports match streams \(soccer, basketball, etc\.\)'
+          \)
+          '''
+          """
+          replacement = "parser_anchor = \"    parser.add_argument(\\n        '--live-match',\"\n"
+          script, count = re.subn(old_anchor, lambda _: replacement, script, count=1)
+          if count != 1:
+              raise SystemExit('Could not relax parser insertion anchor')
+
+          compile(script, '<source-url-patch>', 'exec')
+          exec(compile(script, '<source-url-patch>', 'exec'), {'__name__': '__main__'})
+          PY
+
+      - name: Install and test
+        shell: bash
+        run: |
+          python3 -m py_compile iptv_scraper/cli.py
+          python3 -m pip install -e .
+          iptv-scraper --help | grep -- '--source-url'
+          python3 - <<'PY'
+          from iptv_scraper.cli import IPTVScraper
+
+          scraper = IPTVScraper()
+          html = '''
+          <html>
+            <head><title>Demo Channel</title></head>
+            <body>
+              <video><source src="/hls/master.m3u8?token=demo"></video>
+              <iframe src="https://player.example.org/embed/1"></iframe>
+              <script>const backup = "https://cdn.example.org/live/backup.mpd";</script>
+            </body>
+          </html>
+          '''
+          streams, embeds = scraper._extract_public_stream_candidates(
+              html,
+              'https://tv.example.org/live',
+          )
+          assert 'https://tv.example.org/hls/master.m3u8?token=demo' in streams
+          assert 'https://cdn.example.org/live/backup.mpd' in streams
+          assert 'https://player.example.org/embed/1' in embeds
+          print('source-url extraction sanity test passed')
+          PY
+
+      - name: Commit feature
+        shell: bash
+        run: |
+          rm -f .github/workflows/add-source-url.yml .github/workflows/retry-source-url.yml
+          git config user.name "fertkafi-hub"
+          git config user.email "fertkafi@gmail.com"
+          git add -A
+          git commit -m "Add public channel page source mode"
+          git push
