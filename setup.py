@@ -40,7 +40,10 @@ setup(
         "art>=5.0",
     ],
     extras_require={
-        "browser": ["playwright>=1.40.0"],
+        # Browser mode only needs APIs available in the 1.45 line. Pinning below
+        # 1.46 keeps the optional browser dependency usable on macOS 12 Monterey,
+        # where current Playwright releases no longer provide Chromium builds.
+        "browser": ["playwright>=1.40.0,<1.46.0"],
     },
     entry_points={
         "console_scripts": [
