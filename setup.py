@@ -5,13 +5,13 @@ with open("README.md", "r", encoding="utf-8") as fh:
 
 setup(
     name="iptv-scraper",
-    version="2.7.1",
+    version="2.8.0",
     author="Musashi",
     author_email="",
     description="A powerful CLI tool to scrape and validate working IPTV links",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    url="https://github.com/yourusername/iptv-scraper",
+    url="https://github.com/fertkafi-hub/IPTV-SCRAPPER-PLUS",
     packages=find_packages(),
     classifiers=[
         "Development Status :: 4 - Beta",
@@ -46,7 +46,7 @@ setup(
         ],
     },
     project_urls={
-        "Bug Reports": "https://github.com/MohamedAminGrami/iptv-scraper/issues",
-        "Source": "https://github.com/MohamedAminGrami/iptv-scraper",
+        "Bug Reports": "https://github.com/fertkafi-hub/IPTV-SCRAPPER-PLUS/issues",
+        "Source": "https://github.com/fertkafi-hub/IPTV-SCRAPPER-PLUS",
     },
 )

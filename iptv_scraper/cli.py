@@ -7,7 +7,7 @@ import datetime
 import os
 import argparse
 import re
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 import subprocess
 import sys
 import threading
@@ -632,6 +632,269 @@ class IPTVScraper:
         
         return found
     
+
+    def _is_public_stream_candidate(self, url):
+        """Return True for direct HTTP(S) media/playlist URLs exposed by a page."""
+        if not url or not url.startswith(('http://', 'https://')):
+            return False
+
+        clean_url = url.lower().split('#', 1)[0]
+        path_only = clean_url.split('?', 1)[0]
+        return path_only.endswith(('.m3u8', '.m3u', '.mpd', '.ts'))
+
+    def _extract_public_stream_candidates(self, html_content, base_url):
+        """Extract direct stream URLs and embedded player pages from public HTML."""
+        stream_urls = set()
+        embed_urls = set()
+
+        try:
+            soup = BeautifulSoup(html_content, 'html.parser')
+
+            for tag_name in ('video', 'source', 'iframe', 'embed'):
+                for tag in soup.find_all(tag_name):
+                    raw_url = tag.get('src') or tag.get('data-src')
+                    if not raw_url:
+                        continue
+
+                    raw_url = raw_url.strip()
+                    if raw_url.startswith('//'):
+                        raw_url = 'https:' + raw_url
+
+                    resolved = urljoin(base_url, raw_url)
+                    if not resolved.startswith(('http://', 'https://')):
+                        continue
+
+                    if tag_name in ('iframe', 'embed'):
+                        embed_urls.add(resolved)
+
+                    if self._is_public_stream_candidate(resolved):
+                        stream_urls.add(resolved)
+
+            # Many players place the media URL inside inline JavaScript/JSON.
+            normalized_html = html_content.replace('\\/', '/')
+            patterns = [
+                r'https?://[^\s"\'<>]+?\.(?:m3u8|m3u|mpd|ts)(?:\?[^\s"\'<>]*)?',
+                r'//[^\s"\'<>]+?\.(?:m3u8|m3u|mpd|ts)(?:\?[^\s"\'<>]*)?',
+            ]
+
+            for pattern in patterns:
+                for match in re.findall(pattern, normalized_html, flags=re.IGNORECASE):
+                    candidate = match
+                    if candidate.startswith('//'):
+                        candidate = 'https:' + candidate
+                    candidate = candidate.replace('&amp;', '&')
+                    if self._is_public_stream_candidate(candidate):
+                        stream_urls.add(candidate)
+
+        except Exception:
+            pass
+
+        return sorted(stream_urls), sorted(embed_urls)
+
+    def _validate_hls_segment_delivery(self, playlist_url, timeout=8):
+        """Verify that an HLS manifest ultimately delivers media segment bytes."""
+        headers = {
+            'User-Agent': 'VLC/3.0.20 LibVLC/3.0.20',
+            'Accept': '*/*',
+            'Connection': 'keep-alive',
+        }
+        current_url = playlist_url
+
+        try:
+            for _ in range(4):
+                response = self.session.get(
+                    current_url,
+                    timeout=timeout,
+                    allow_redirects=True,
+                    headers=headers,
+                    verify=False,
+                )
+                if response.status_code != 200:
+                    return False
+
+                text = response.text
+                if '#EXTM3U' not in text:
+                    return False
+
+                lines = [line.strip() for line in text.splitlines() if line.strip()]
+
+                # Master playlist: follow the first advertised video variant.
+                next_playlist = None
+                for index, line in enumerate(lines):
+                    if line.startswith('#EXT-X-STREAM-INF'):
+                        for next_line in lines[index + 1:]:
+                            if not next_line.startswith('#'):
+                                next_playlist = urljoin(response.url, next_line)
+                                break
+                        if next_playlist:
+                            break
+
+                if next_playlist:
+                    current_url = next_playlist
+                    continue
+
+                # Media playlist: fetch the first segment and require actual bytes.
+                segment = next((line for line in lines if not line.startswith('#')), None)
+                if not segment:
+                    return False
+
+                segment_url = urljoin(response.url, segment)
+                with self.session.get(
+                    segment_url,
+                    timeout=timeout,
+                    stream=True,
+                    allow_redirects=True,
+                    headers=headers,
+                    verify=False,
+                ) as segment_response:
+                    if segment_response.status_code not in (200, 206):
+                        return False
+                    for chunk in segment_response.iter_content(16384):
+                        if chunk:
+                            return True
+                return False
+
+        except Exception:
+            return False
+
+        return False
+
+    def scrape_source_urls(self, source_urls, num_links=10, channel_name=''):
+        """Scrape direct public stream URLs from one or more channel web pages."""
+        if isinstance(source_urls, str):
+            source_urls = [source_urls]
+
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) '
+                          'AppleWebKit/537.36 Chrome/128.0 Safari/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        }
+
+        candidates = {}
+        visited_pages = set()
+
+        print(colored(f"[*] Loading {len(source_urls)} source page(s)...", "cyan"))
+
+        for source_url in source_urls:
+            if self.shutdown_flag.is_set() or self.total_working >= num_links:
+                break
+
+            if not source_url.startswith(('http://', 'https://')):
+                print(colored(f"[!] Skipping invalid URL: {source_url}", "red"))
+                continue
+
+            queue = [(source_url, 0)]
+            embeds_seen_for_source = 0
+            fallback_title = urlparse(source_url).netloc or 'Web Stream'
+
+            while queue and not self.shutdown_flag.is_set():
+                page_url, depth = queue.pop(0)
+                if page_url in visited_pages:
+                    continue
+                visited_pages.add(page_url)
+
+                try:
+                    response = self.session.get(
+                        page_url,
+                        timeout=10,
+                        allow_redirects=True,
+                        headers=headers,
+                        verify=False,
+                    )
+                    if response.status_code != 200:
+                        print(colored(
+                            f"[✗] Page returned HTTP {response.status_code}: {page_url}",
+                            "red"
+                        ))
+                        continue
+
+                    content_type = response.headers.get('content-type', '').lower()
+
+                    # A supplied URL may itself be a direct playlist/stream.
+                    if self._is_public_stream_candidate(response.url):
+                        candidates.setdefault(
+                            response.url,
+                            channel_name or fallback_title
+                        )
+                        continue
+
+                    if 'html' not in content_type and 'text' not in content_type:
+                        continue
+
+                    html_content = response.text
+                    soup = BeautifulSoup(html_content, 'html.parser')
+                    page_title = ''
+                    if soup.title and soup.title.string:
+                        page_title = ' '.join(soup.title.string.split())
+
+                    title = channel_name or page_title or fallback_title
+                    streams, embeds = self._extract_public_stream_candidates(
+                        html_content,
+                        response.url,
+                    )
+
+                    for stream_url in streams:
+                        candidates.setdefault(stream_url, title)
+
+                    # Follow public embedded player pages only one level deep.
+                    if depth < 1:
+                        for embed_url in embeds:
+                            if embeds_seen_for_source >= 12:
+                                break
+                            if embed_url not in visited_pages:
+                                queue.append((embed_url, depth + 1))
+                                embeds_seen_for_source += 1
+
+                except requests.RequestException as exc:
+                    print(colored(f"[✗] Could not load {page_url}: {exc}", "red"))
+
+        if not candidates:
+            print(colored(
+                "[!] No direct public .m3u8/.m3u/.mpd/.ts URLs were exposed by the page(s).",
+                "yellow"
+            ))
+            return 0
+
+        print(colored(f"[*] Found {len(candidates)} candidate stream URL(s).", "cyan"))
+        print(colored("[*] Validating candidates...", "yellow"))
+
+        for index, (stream_url, title) in enumerate(candidates.items(), 1):
+            if self.shutdown_flag.is_set() or self.total_working >= num_links:
+                break
+
+            print(colored(f"[{index}/{len(candidates)}] {title}", "white"), end=" ")
+
+            if not self.test_iptv_link(stream_url, show_progress=False):
+                print(colored("✗", "red"))
+                continue
+
+            path_only = stream_url.lower().split('?', 1)[0]
+            if path_only.endswith('.m3u8'):
+                if not self._validate_hls_segment_delivery(stream_url):
+                    print(colored("✗ manifest reachable, but no media segment", "red"))
+                    continue
+
+            self.total_working += 1
+            saved_title = title
+            if any(item.get('title') == saved_title for item in self.scraped_links):
+                saved_title = f"{title} {self.total_working}"
+
+            self.scraped_links.append({
+                'title': saved_title,
+                'url': stream_url,
+            })
+            print(colored(f"✓ [{self.total_working}/{num_links}]", "green"))
+
+        print()
+        print(colored("=" * 60, "green"))
+        print(colored(
+            f"[✓] Found {len(self.scraped_links)} working stream(s) from source URL(s).",
+            "green"
+        ))
+        print(colored("=" * 60, "green"))
+
+        return len(self.scraped_links)
+
     def extract_iframe_streams(self, html_content):
         """Extract streaming URLs from iframes and embed tags"""
         stream_urls = []
@@ -1816,6 +2079,14 @@ def main():
     )
     
     parser.add_argument(
+    '--source-url',
+    action='append',
+    default=[],
+    metavar='URL',
+    help='Scrape direct public stream URLs from a channel web page (repeatable)'
+)
+
+    parser.add_argument(
         '--live-match',
         action='store_true',
         help='Search for live sports match streams (soccer, basketball, etc.)'
@@ -1871,13 +2142,45 @@ def main():
     art = text2art("IPTV  SCRAPER", font="block")
     print(colored(art, "cyan"))
     print(colored("═" * 70, "yellow"))
-    print(colored("        🎬 Advanced Multi-Source Stream Finder v2.7.0", "green"))
+    print(colored("        🎬 Advanced Multi-Source Stream Finder v2.8.0", "green"))
     print(colored("        ⚡ 25 Parallel Workers | 🔄 Connection Pooling | 🧠 Smart Filtering", "cyan"))
     print(colored("═" * 70, "yellow"))
     print(colored("        Developed By MSXI:7050", "magenta"))
     print()
     
     try:
+        # Direct public channel-page mode. Existing modes remain unchanged.
+        if args.source_url:
+            channel_name = args.channel.strip() if args.channel else ''
+            num_links = args.number if args.number is not None else 10
+            if num_links <= 0:
+                parser.error("--number must be greater than zero")
+
+            print(colored("🌐 Source URL Mode Activated", "green"))
+            print(colored(
+                f"[*] Scanning {len(args.source_url)} public channel page(s)...",
+                "yellow"
+            ))
+            print()
+
+            scraper = IPTVScraper()
+            scraper_instance = scraper
+            current_channel = channel_name or "source_url"
+            scraper.scrape_source_urls(
+                args.source_url,
+                num_links=num_links,
+                channel_name=channel_name,
+            )
+
+            if scraper.scraped_links:
+                output_name = args.output if args.output else (
+                    channel_name if channel_name else "source_url_channels"
+                )
+                scraper.save_m3u(output_name, auto_save=args.auto_save)
+            else:
+                print(colored("[!] No links to save.", "red"))
+            return 0
+
         # Handle live match mode
         if args.live_match:
             print(colored("⚽ Live Match Mode Activated", "green"))

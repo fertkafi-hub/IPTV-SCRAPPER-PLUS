@@ -13,6 +13,6 @@ Usage:
     ipsc -c "sports" -n 5 --auto-save
 """
 
-__version__ = "2.7.1"
+__version__ = "2.8.0"
 __author__ = "Musashi"
 __license__ = "MIT"

@@ -1,5 +1,15 @@
 # IPTV Scraper - Complete Changelog
 
+## Version 2.8.0 (2026-09-08) - Public Channel Page Sources 🌐
+
+- Added repeatable `--source-url URL` CLI option.
+- Extracts direct `.m3u8`, `.m3u`, `.mpd`, and `.ts` URLs exposed in public HTML.
+- Follows public iframe/embed pages one level deep.
+- HLS candidates must deliver real media segment bytes before being saved.
+- Existing standard, NSFW, and live-match modes remain unchanged.
+
+---
+
 ## Version 2.7.0 (2024-12-24) - Extreme Performance Optimization ⚡
 
 ### 🚀 Major Performance Enhancements
