@@ -1,0 +1,168 @@
+name: Retry source-url feature v2
+
+on:
+  push:
+    paths:
+      - '.github/workflows/retry-source-url-v2.yml'
+
+permissions:
+  contents: write
+
+jobs:
+  patch:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Apply corrected feature patch
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          import re
+          import textwrap
+
+          original_workflow = Path('.github/workflows/add-source-url.yml').read_text(encoding='utf-8')
+          match = re.search(
+              r"python3 - <<'PY'\n(?P<body>.*?\n)\s{10}PY\n",
+              original_workflow,
+              flags=re.S,
+          )
+          if not match:
+              raise SystemExit('Could not extract original feature patch')
+
+          script = textwrap.dedent(match.group('body'))
+
+          parser_pattern = r"""parser_anchor = '''    parser\.add_argument\(
+              '--live-match',
+              action='store_true',
+              help='Search for live sports match streams \(soccer, basketball, etc\.\)'
+          \)
+          '''
+          """
+          parser_replacement = "parser_anchor = \"    parser.add_argument(\\n        '--live-match',\"\n"
+          script, parser_count = re.subn(
+              parser_pattern,
+              lambda _: parser_replacement,
+              script,
+              count=1,
+          )
+          if parser_count != 1:
+              raise SystemExit('Could not relax parser anchor')
+
+          # Remove the original fragile main() insertion from the reusable patch.
+          main_patch_pattern = (
+              r"\nmain_anchor = '''    try:\n.*?"
+              r"cli = cli\.replace\(main_anchor, source_mode, 1\)\n"
+          )
+          script, main_count = re.subn(
+              main_patch_pattern,
+              '\n',
+              script,
+              count=1,
+              flags=re.S,
+          )
+          if main_count != 1:
+              raise SystemExit('Could not remove fragile main patch')
+
+          compile(script, '<base-feature-patch>', 'exec')
+          exec(compile(script, '<base-feature-patch>', 'exec'), {'__name__': '__main__'})
+
+          # Insert the new mode using the actual indentation found in cli.py.
+          cli_path = Path('iptv_scraper/cli.py')
+          cli = cli_path.read_text(encoding='utf-8')
+          marker = re.search(
+              r'(?m)^(?P<indent>[ \t]*)# Handle live match mode\s*$',
+              cli,
+          )
+          if not marker:
+              raise SystemExit('Could not locate live-match marker in main()')
+
+          indent = marker.group('indent')
+          inner = indent + '    '
+          inner2 = inner + '    '
+          inner3 = inner2 + '    '
+
+          lines = [
+              f'{indent}# Direct public channel-page mode. Existing modes remain unchanged.',
+              f'{indent}if args.source_url:',
+              f"{inner}channel_name = args.channel.strip() if args.channel else ''",
+              f'{inner}num_links = args.number if args.number is not None else 10',
+              f'{inner}if num_links <= 0:',
+              f'{inner2}parser.error("--number must be greater than zero")',
+              '',
+              f'{inner}print(colored("🌐 Source URL Mode Activated", "green"))',
+              f'{inner}print(colored(',
+              f'{inner2}f"[*] Scanning {{len(args.source_url)}} public channel page(s)...",',
+              f'{inner2}"yellow"',
+              f'{inner}))',
+              f'{inner}print()',
+              '',
+              f'{inner}scraper = IPTVScraper()',
+              f'{inner}scraper_instance = scraper',
+              f'{inner}current_channel = channel_name or "source_url"',
+              f'{inner}scraper.scrape_source_urls(',
+              f'{inner2}args.source_url,',
+              f'{inner2}num_links=num_links,',
+              f'{inner2}channel_name=channel_name,',
+              f'{inner})',
+              '',
+              f'{inner}if scraper.scraped_links:',
+              f'{inner2}output_name = args.output if args.output else (',
+              f'{inner3}channel_name if channel_name else "source_url_channels"',
+              f'{inner2})',
+              f'{inner2}scraper.save_m3u(output_name, auto_save=args.auto_save)',
+              f'{inner}else:',
+              f'{inner2}print(colored("[!] No links to save.", "red"))',
+              f'{inner}return 0',
+              '',
+              f'{indent}# Handle live match mode',
+          ]
+          source_mode = '\n'.join(lines)
+          cli = cli[:marker.start()] + source_mode + cli[marker.end():]
+          cli_path.write_text(cli, encoding='utf-8')
+          PY
+
+      - name: Install and test
+        shell: bash
+        run: |
+          python3 -m py_compile iptv_scraper/cli.py
+          python3 -m pip install -e .
+          iptv-scraper --help | grep -- '--source-url'
+          python3 - <<'PY'
+          from iptv_scraper.cli import IPTVScraper
+
+          scraper = IPTVScraper()
+          html = '''
+          <html>
+            <head><title>Demo Channel</title></head>
+            <body>
+              <video><source src="/hls/master.m3u8?token=demo"></video>
+              <iframe src="https://player.example.org/embed/1"></iframe>
+              <script>const backup = "https://cdn.example.org/live/backup.mpd";</script>
+            </body>
+          </html>
+          '''
+          streams, embeds = scraper._extract_public_stream_candidates(
+              html,
+              'https://tv.example.org/live',
+          )
+          assert 'https://tv.example.org/hls/master.m3u8?token=demo' in streams
+          assert 'https://cdn.example.org/live/backup.mpd' in streams
+          assert 'https://player.example.org/embed/1' in embeds
+          print('source-url extraction sanity test passed')
+          PY
+
+      - name: Commit tested feature
+        shell: bash
+        run: |
+          rm -f \
+            .github/workflows/add-source-url.yml \
+            .github/workflows/retry-source-url.yml \
+            .github/workflows/retry-source-url-v2.yml
+          git config user.name "fertkafi-hub"
+          git config user.email "fertkafi@gmail.com"
+          git add -A
+          git commit -m "Add public channel page source mode"
+          git push
